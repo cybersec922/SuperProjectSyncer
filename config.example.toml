@@ -1,0 +1,32 @@
+[global]
+listen = "0.0.0.0:7741"
+data_dir = "~/.superprojectsyncer"
+discovery = true
+
+[[sync]]
+name = "sync-example"
+local_path = "D:\\tools\\rainmeter"
+direction = "bidirectional"
+role = "provider"
+approval = "auto"
+peers = ["192.168.1.50:7741"]
+sync_key = "change-me-long-random"
+ignore = [
+  ".env",
+  "**/.env",
+  "*.log",
+  "node_modules/**",
+  "secrets/",
+  ".git/**",
+]
+
+# Linux example (use on the other machine):
+# [[sync]]
+# name = "sync-example"
+# local_path = "/home/usernamehehe/rainmeter"
+# direction = "bidirectional"
+# role = "provider"
+# approval = "auto"
+# peers = ["192.168.1.10:7741"]
+# sync_key = "change-me-long-random"
+# ignore = [".env", "node_modules/**"]

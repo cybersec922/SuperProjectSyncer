@@ -1,0 +1,5 @@
+/bin/
+*.exe
+*.db
+config.toml
+.superprojectsyncer/
