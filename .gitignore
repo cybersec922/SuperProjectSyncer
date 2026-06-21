@@ -2,4 +2,11 @@
 *.exe
 *.db
 config.toml
+configs/
 .superprojectsyncer/
+test/data-a/
+test/data-b/
+test/sync-a/
+test/sync-b/
+test/peer-a.log
+test/peer-b.log

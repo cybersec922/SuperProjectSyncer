@@ -113,6 +113,23 @@ func (e *Engine) OnFolderChanged(folder string) {
 	e.broadcastFolder(folder)
 }
 
+// OnPeerConnected pushes the full tree when a provider gains a new peer (initial sync).
+func (e *Engine) OnPeerConnected() {
+	if !e.Cfg.CanSend() {
+		return
+	}
+	if e.Approval != nil {
+		e.Approval.Wait(".")
+	}
+	manifest, err := e.buildManifestForFolder(".")
+	if err != nil {
+		log.Printf("[%s] initial push manifest: %v", e.Cfg.Name, err)
+		return
+	}
+	log.Printf("[%s] initial push to peer: %d files", e.Cfg.Name, len(manifest.Files))
+	e.broadcastFolder(".")
+}
+
 func (e *Engine) broadcastFolder(folder string) {
 	manifest, err := e.buildManifestForFolder(folder)
 	if err != nil {
@@ -448,6 +465,7 @@ func (e *Engine) ConnectAndHello(addr string, dial func(string, string, time.Dur
 		return nil, err
 	}
 	e.AddPeer(p)
+	go e.OnPeerConnected()
 	go e.HandleIncoming(p)
 	return p, nil
 }

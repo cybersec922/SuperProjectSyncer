@@ -69,30 +69,52 @@ func configFlag(args []string) (string, []string) {
 
 func runCmd(args []string) {
 	cfgPath, _ := configFlag(args)
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		fatal(err)
+
+	runDaemon := func(ctx context.Context) error {
+		cfg, err := config.Load(cfgPath)
+		if err != nil {
+			return err
+		}
+		application, err := app.New(cfg)
+		if err != nil {
+			return err
+		}
+		defer application.Close()
+
+		if err := application.Start(ctx); err != nil {
+			return err
+		}
+		log.Printf("running with %d sync group(s); peer_id=%s", len(cfg.Syncs), application.PeerID)
+		<-ctx.Done()
+		log.Println("shutting down...")
+		return nil
 	}
 
-	application, err := app.New(cfg)
-	if err != nil {
-		fatal(err)
+	if service.RunIfService(runDaemon) {
+		return
 	}
-	defer application.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := application.Start(ctx); err != nil {
-		fatal(err)
-	}
+	done := make(chan error, 1)
+	go func() { done <- runDaemon(ctx) }()
 
-	log.Printf("running with %d sync group(s); peer_id=%s", len(cfg.Syncs), application.PeerID)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Println("shutting down...")
-	cancel()
+	select {
+	case s := <-sig:
+		log.Printf("signal: %v", s)
+		cancel()
+	case err := <-done:
+		if err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if err := <-done; err != nil {
+		fatal(err)
+	}
 }
 
 func installCmd(args []string) {

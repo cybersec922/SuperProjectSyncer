@@ -185,7 +185,8 @@ func (a *App) handleInbound(conn net.Conn) {
 	p := &syncengine.Peer{ID: peerID, Addr: addr, Conn: conn}
 	g.Engine.AddPeer(p)
 	log.Printf("[%s] inbound peer %s from %s", g.Cfg.Name, peerID, addr)
-	g.Engine.HandleIncoming(p)
+	go g.Engine.OnPeerConnected()
+	go g.Engine.HandleIncoming(p)
 }
 
 func (a *App) peerDialLoop(ctx context.Context) {

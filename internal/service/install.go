@@ -33,40 +33,6 @@ func Uninstall() error {
 	}
 }
 
-func installWindows(exePath, configPath string) error {
-	if _, err := exec.LookPath("sc"); err != nil {
-		return fmt.Errorf("sc.exe not found")
-	}
-	_ = exec.Command("sc", "stop", serviceName).Run()
-	_ = exec.Command("sc", "delete", serviceName).Run()
-
-	displayName := serviceName
-	binPath := fmt.Sprintf("\"%s\" run --config \"%s\"", exePath, configPath)
-	cmd := exec.Command("sc", "create", serviceName,
-		fmt.Sprintf("binPath= %s", binPath),
-		"start= auto",
-		fmt.Sprintf("DisplayName= %s", displayName),
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sc create: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-	out, err = exec.Command("sc", "start", serviceName).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sc start: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
-func uninstallWindows() error {
-	_ = exec.Command("sc", "stop", serviceName).Run()
-	out, err := exec.Command("sc", "delete", serviceName).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("sc delete: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
 func installLinux(exePath, configPath string) error {
 	unitPath := "/etc/systemd/system/superprojectsyncer.service"
 	unit := fmt.Sprintf(`[Unit]

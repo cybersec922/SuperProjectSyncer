@@ -1,0 +1,14 @@
+[global]
+listen = "127.0.0.1:7742"
+data_dir = "test/data-b"
+discovery = false
+
+[[sync]]
+name = "local-test"
+local_path = "test/sync-b"
+direction = "bidirectional"
+role = "provider"
+approval = "auto"
+peers = ["127.0.0.1:7741"]
+sync_key = "local-test-secret-key"
+ignore = [".env", "*.log"]
