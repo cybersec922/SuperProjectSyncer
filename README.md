@@ -4,6 +4,34 @@ P2P folder sync daemon for Windows and Linux. Run the app on each machine; peers
 
 See [BUILD_PLAN.md](BUILD_PLAN.md) for language, architecture, and how to change the stack.
 
+## Download (releases)
+
+Pre-built binaries are on the [Releases](https://github.com/cybersec922/SuperProjectSyncer/releases) page:
+
+| File | Platform |
+|------|----------|
+| `sps-windows-amd64.exe` | Windows 64-bit |
+| `sps-linux-amd64` | Linux x86_64 |
+| `sps-linux-arm64` | Linux ARM64 (e.g. Raspberry Pi, some VPS) |
+
+**Windows:** download the `.exe`, place it anywhere (e.g. `C:\Tools\sps.exe`), then:
+
+```powershell
+.\sps.exe run --config config.toml
+.\sps.exe install --config config.toml   # run PowerShell as Administrator
+```
+
+**Linux:** download, make executable, install:
+
+```bash
+chmod +x sps-linux-amd64
+sudo mv sps-linux-amd64 /usr/local/bin/sps
+sps run --config config.toml
+sudo sps install --config /etc/superprojectsyncer/config.toml
+```
+
+Copy `config.example.toml` to `config.toml` and edit paths, peers, and `sync_key` before running.
+
 ## Quick start
 
 ```bash

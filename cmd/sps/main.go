@@ -14,6 +14,8 @@ import (
 	"github.com/superdata/superprojectsyncer/internal/service"
 )
 
+var version = "dev"
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("sps: ")
@@ -37,6 +39,8 @@ func main() {
 		statusCmd(os.Args[2:])
 	case "approve":
 		approveCmd(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println(version)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -55,6 +59,7 @@ Usage:
   sps uninstall                 Remove OS service
   sps status [--config PATH]    Show sync groups and peers
   sps approve SYNC FOLDER       Approve folder in ask_folder mode
+  sps version                   Print version
 
 See config.example.toml and BUILD_PLAN.md for details.
 `)
