@@ -1,6 +1,6 @@
 # SuperProjectSyncer
 
-P2P folder sync daemon for Windows and Linux. Run the app on each machine; peers connect via **mDNS discovery** and/or **direct IP**, and sync only changed files.
+P2P folder sync daemon for Windows and Linux. Peers connect via **direct IP**, **LAN discovery (mDNS)**, or a **relay hub** on a public VPS when both sides are behind NAT. Only changed files are transferred.
 
 See [BUILD_PLAN.md](BUILD_PLAN.md) for language, architecture, and how to change the stack.
 
@@ -54,6 +54,9 @@ Each `[[sync]]` section is a named sync group. Machines with the same `name` and
 listen = "0.0.0.0:7741"
 data_dir = "~/.superprojectsyncer"
 discovery = true
+# log_file = ""              # default: <data_dir>/sps.log
+# relay = "vps-ip:7750"      # optional NAT hub (see Relay section)
+# relay_key = "relay-secret"
 
 [[sync]]
 name = "sync-example"
@@ -91,12 +94,72 @@ sps approve sync-example myfolder
 ## Commands
 
 ```bash
-sps run [--config PATH]       # Run daemon (foreground)
-sps install [--config PATH]   # Install OS service (admin / sudo)
-sps uninstall                 # Remove service
-sps status [--config PATH]    # Show groups, peers, pending approvals
-sps approve SYNC FOLDER       # Approve folder in ask_folder mode
+sps run [--config PATH]           # Run sync daemon (foreground or service)
+sps install [--config PATH]       # Install OS service (admin / sudo)
+sps uninstall                     # Remove service
+sps status [--config PATH]        # Brief sync status (works while service runs)
+sps status -v [--config PATH]     # Detailed: peers, transfers, file progress
+sps watch [--config PATH]         # Live refresh every 2s (Ctrl+C to stop)
+sps logs [--config PATH] [-n 50]  # Show last N lines of sps.log
+sps approve SYNC FOLDER           # Approve folder in ask_folder mode
+sps relay run [--config PATH]     # Run relay hub on a public VPS
+sps relay status [--config PATH]  # Show relay config
+sps version                       # Print version
 ```
+
+**Monitoring** (Windows & Linux — same commands):
+
+- Log file defaults to `<data_dir>/sps.log` (e.g. `~/.superprojectsyncer/sps.log` or `/root/.superprojectsyncer/sps.log`)
+- `sps status -v` shows active sync jobs: files done/left, bytes transferred, current filename
+- `sps watch` is useful during a large initial sync
+- Set `log_file = "none"` in config to disable file logging
+
+## Relay server (both peers behind NAT)
+
+When **neither** machine has a public IP, run a **relay** on your VPS. Both peers connect **outbound** to the relay — no port forwarding on home networks.
+
+**1. On VPS** (public IP, open port `7750/tcp`):
+
+```bash
+cp relay.example.toml relay.toml
+# edit key = "your-long-secret"
+sps relay run --config relay.toml
+```
+
+Or as a systemd service:
+
+```bash
+sps relay run --listen 0.0.0.0:7750 --key your-long-secret
+```
+
+**2. On each peer** (Windows + Linux configs):
+
+```toml
+[global]
+relay = "75.119.139.223:7750"
+relay_key = "your-long-secret"   # must match relay.toml key
+
+[[sync]]
+name = "cronwebapp"
+# peers = []   # not needed — relay matches same name + sync_key
+sync_key = "CRAZYMFTAPMAN_HEHEHEHAHHAHAHA69659"
+```
+
+Peers in the same `name` + `sync_key` room are connected through the relay automatically. You can still use direct `peers = [...]` alongside relay for hybrid setups.
+
+| Mode | When to use |
+|------|-------------|
+| Direct `peers` | One side has public IP (your current Windows→Linux push) |
+| `relay` | Both behind NAT / no inbound ports |
+| Both | Relay as fallback + direct when reachable |
+
+### Networking quick reference
+
+| Scenario | What to open | Client config |
+|----------|--------------|---------------|
+| Push to VPS (one public IP) | Inbound `7741` on server | Provider: `peers = ["server:7741"]` |
+| Both behind NAT | Inbound `7750` on VPS (relay) | Both: `relay` + `relay_key`; `peers = []` OK |
+| Same LAN | Nothing (mDNS) | `discovery = true`, same `name` + `sync_key` |
 
 ## Service install
 
@@ -169,3 +232,10 @@ GOOS=windows GOARCH=amd64 go build -o bin/sps.exe ./cmd/sps
 ```
 
 Details: [BUILD_PLAN.md](BUILD_PLAN.md)
+
+## Config templates
+
+| File | Use |
+|------|-----|
+| `config.example.toml` | Sync daemon on each machine |
+| `relay.example.toml` | Relay hub on a public VPS |

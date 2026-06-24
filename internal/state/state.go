@@ -60,7 +60,10 @@ func (s *Store) migrate() error {
 			PRIMARY KEY (sync_name, peer_id)
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.migrateActivity()
 }
 
 type FileRecord struct {

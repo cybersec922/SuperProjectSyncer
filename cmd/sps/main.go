@@ -7,10 +7,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/superdata/superprojectsyncer/internal/app"
 	"github.com/superdata/superprojectsyncer/internal/config"
+	"github.com/superdata/superprojectsyncer/internal/logging"
+	"github.com/superdata/superprojectsyncer/internal/relay"
 	"github.com/superdata/superprojectsyncer/internal/service"
 )
 
@@ -37,9 +42,15 @@ func main() {
 		fmt.Println("Service uninstalled.")
 	case "status":
 		statusCmd(os.Args[2:])
+	case "watch":
+		watchCmd(os.Args[2:])
+	case "logs":
+		logsCmd(os.Args[2:])
 	case "approve":
 		approveCmd(os.Args[2:])
-	case "version", "-v", "--version":
+	case "relay":
+		relayCmd(os.Args[2:])
+	case "version", "-V", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
 		usage()
@@ -54,32 +65,57 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `SuperProjectSyncer (sps) — P2P folder sync
 
 Usage:
-  sps run [--config PATH]       Run sync daemon (foreground)
-  sps install [--config PATH]   Install as OS service (admin/sudo)
-  sps uninstall                 Remove OS service
-  sps status [--config PATH]    Show sync groups and peers
-  sps approve SYNC FOLDER       Approve folder in ask_folder mode
-  sps version                   Print version
+  sps run [--config PATH]         Run sync daemon (foreground or service)
+  sps install [--config PATH]     Install as OS service (admin/sudo)
+  sps uninstall                   Remove OS service
+  sps status [--config PATH] [-v] Show sync status (reads live state DB)
+  sps watch [--config PATH] [-v]  Refresh status every 2s (Ctrl+C to stop)
+  sps logs [--config PATH] [-n N] Show last N lines of the log file
+  sps approve SYNC FOLDER         Approve folder in ask_folder mode
+  sps relay run [--config PATH]   Run relay server (public VPS hub for NAT peers)
+  sps relay status [--config PATH]
+  sps version                     Print version
+
+Logs default to <data_dir>/sps.log (set global.log_file in config).
 
 See config.example.toml and BUILD_PLAN.md for details.
 `)
 }
 
-func configFlag(args []string) (string, []string) {
+type cmdFlags struct {
+	config  string
+	verbose bool
+	lines   int
+}
+
+func parseCmdFlags(args []string) cmdFlags {
 	fs := flag.NewFlagSet("cmd", flag.ExitOnError)
 	cfg := fs.String("config", "config.toml", "path to config file")
+	verbose := fs.Bool("v", false, "verbose output (files, transfers, activity)")
+	lines := fs.Int("n", 50, "number of log lines to show")
 	_ = fs.Parse(args)
-	return *cfg, fs.Args()
+	return cmdFlags{config: *cfg, verbose: *verbose, lines: *lines}
+}
+
+func loadConfig(path string) *config.Config {
+	cfg, err := config.Load(path)
+	if err != nil {
+		fatal(err)
+	}
+	return cfg
 }
 
 func runCmd(args []string) {
-	cfgPath, _ := configFlag(args)
+	flags := parseCmdFlags(args)
 
 	runDaemon := func(ctx context.Context) error {
-		cfg, err := config.Load(cfgPath)
+		cfg := loadConfig(flags.config)
+		logCloser, err := logging.Setup(cfg.Global.DataDir, cfg.Global.LogFile)
 		if err != nil {
 			return err
 		}
+		defer logCloser.Close()
+
 		application, err := app.New(cfg)
 		if err != nil {
 			return err
@@ -123,39 +159,85 @@ func runCmd(args []string) {
 }
 
 func installCmd(args []string) {
-	cfgPath, _ := configFlag(args)
+	flags := parseCmdFlags(args)
 	exe, err := service.ExecutablePath()
 	if err != nil {
 		fatal(err)
 	}
-	if err := service.Install(exe, cfgPath); err != nil {
+	if err := service.Install(exe, flags.config); err != nil {
 		fatal(err)
 	}
 	fmt.Println("Service installed and started.")
 }
 
 func statusCmd(args []string) {
-	cfgPath, _ := configFlag(args)
-	cfg, err := config.Load(cfgPath)
+	flags := parseCmdFlags(args)
+	cfg := loadConfig(flags.config)
+	out, err := app.StatusFromConfig(cfg, flags.verbose)
 	if err != nil {
 		fatal(err)
 	}
-	application, err := app.New(cfg)
+	fmt.Println(out)
+}
+
+func watchCmd(args []string) {
+	flags := parseCmdFlags(args)
+	cfg := loadConfig(flags.config)
+	interval := 2 * time.Second
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	printWatch := func() {
+		fmt.Print("\033[2J\033[H")
+		fmt.Printf("SuperProjectSyncer watch — refreshing every %s (Ctrl+C to stop)\n\n", interval)
+		out, err := app.StatusFromConfig(cfg, true)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return
+		}
+		fmt.Println(out)
+	}
+	printWatch()
+
+	for {
+		select {
+		case <-sig:
+			return
+		case <-ticker.C:
+			printWatch()
+		}
+	}
+}
+
+func logsCmd(args []string) {
+	flags := parseCmdFlags(args)
+	cfg := loadConfig(flags.config)
+	path := logging.ResolvePath(cfg.Global.DataDir, cfg.Global.LogFile)
+	if path == "" {
+		fmt.Println("file logging disabled (log_file = none)")
+		return
+	}
+	out, err := logging.Tail(path, flags.lines)
 	if err != nil {
 		fatal(err)
 	}
-	defer application.Close()
-	fmt.Println(application.Status())
+	fmt.Println(out)
 }
 
 func approveCmd(args []string) {
 	if len(args) < 2 {
-		fatal(fmt.Errorf("usage: sps approve SYNC_NAME FOLDER"))
+		fatal(fmt.Errorf("usage: sps approve SYNC_NAME FOLDER [--config PATH]"))
 	}
 	syncName, folder := args[0], args[1]
 	cfgPath := "config.toml"
-	if len(args) > 2 {
-		cfgPath = args[2]
+	for i, a := range args {
+		if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+		}
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -174,4 +256,94 @@ func approveCmd(args []string) {
 
 func fatal(err error) {
 	log.Fatal(err)
+}
+
+func relayCmd(args []string) {
+	if len(args) == 0 {
+		fatal(fmt.Errorf("usage: sps relay run|status [--config PATH]"))
+	}
+	switch args[0] {
+	case "run":
+		relayRunCmd(args[1:])
+	case "status":
+		relayStatusCmd(args[1:])
+	default:
+		fatal(fmt.Errorf("unknown relay command: %s", args[0]))
+	}
+}
+
+func relayRunCmd(args []string) {
+	fs := flag.NewFlagSet("relay run", flag.ExitOnError)
+	cfgPath := fs.String("config", "relay.toml", "relay server config")
+	listen := fs.String("listen", "", "listen address (overrides config)")
+	key := fs.String("key", "", "relay auth key (overrides config)")
+	logFile := fs.String("log-file", "", "log file path")
+	_ = fs.Parse(args)
+
+	var cfg config.RelayServerConfig
+	if *listen != "" && *key != "" {
+		cfg = config.RelayServerConfig{Listen: *listen, Key: *key, LogFile: *logFile}
+	} else {
+		loaded, err := config.LoadRelayServer(*cfgPath)
+		if err != nil {
+			fatal(err)
+		}
+		cfg = *loaded
+		if *listen != "" {
+			cfg.Listen = *listen
+		}
+		if *key != "" {
+			cfg.Key = *key
+		}
+		if *logFile != "" {
+			cfg.LogFile = *logFile
+		}
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = "0.0.0.0:7750"
+	}
+	if cfg.Key == "" {
+		fatal(fmt.Errorf("relay key required (--key or key in config)"))
+	}
+
+	logDir := os.TempDir()
+	if cfg.LogFile != "" && !strings.EqualFold(cfg.LogFile, "none") {
+		lf := cfg.LogFile
+		if !filepath.IsAbs(lf) {
+			lf = filepath.Join(logDir, lf)
+		}
+		logCloser, err := logging.Setup(logDir, lf)
+		if err != nil {
+			fatal(err)
+		}
+		defer logCloser.Close()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		cancel()
+	}()
+
+	srv := relay.NewServer(relay.ServerConfig{Listen: cfg.Listen, Key: cfg.Key})
+	log.Printf("relay server starting on %s", cfg.Listen)
+	if err := srv.Run(ctx); err != nil {
+		fatal(err)
+	}
+}
+
+func relayStatusCmd(args []string) {
+	fs := flag.NewFlagSet("relay status", flag.ExitOnError)
+	cfgPath := fs.String("config", "relay.toml", "relay server config")
+	_ = fs.Parse(args)
+	cfg, err := config.LoadRelayServer(*cfgPath)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("relay config: listen=%s key=***\n", cfg.Listen)
+	fmt.Println("(Run 'sps relay run' to start; open this port on your VPS firewall)")
 }

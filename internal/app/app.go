@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/superdata/superprojectsyncer/internal/config"
 	"github.com/superdata/superprojectsyncer/internal/discovery"
 	"github.com/superdata/superprojectsyncer/internal/protocol"
+	"github.com/superdata/superprojectsyncer/internal/relay"
 	"github.com/superdata/superprojectsyncer/internal/state"
 	syncengine "github.com/superdata/superprojectsyncer/internal/sync"
 	"github.com/superdata/superprojectsyncer/internal/transport"
@@ -21,11 +23,12 @@ import (
 )
 
 type Group struct {
-	Cfg       config.Sync
-	Engine    *syncengine.Engine
-	Approval  *approval.Queue
-	Discovery *discovery.Manager
-	Watcher   *watcher.Watcher
+	Cfg         config.Sync
+	Engine      *syncengine.Engine
+	Approval    *approval.Queue
+	Discovery   *discovery.Manager
+	Watcher     *watcher.Watcher
+	relayCancel context.CancelFunc
 }
 
 type App struct {
@@ -59,6 +62,10 @@ func (a *App) Close() error {
 	}
 	if a.ln != nil {
 		a.ln.Close()
+	}
+	if len(a.groups) > 0 {
+		_ = a.Store.AppendActivity("", "info", "daemon stopped")
+		_ = a.Store.ClearDaemonInfo()
 	}
 	return a.Store.Close()
 }
@@ -94,8 +101,89 @@ func (a *App) Start(ctx context.Context) error {
 		a.groupBy[syncCfg.Name] = g
 	}
 
+	_ = a.Store.SetDaemonInfo(a.PeerID, os.Getpid(), a.Config.Global.Listen)
+	_ = a.Store.AppendActivity("", "info", fmt.Sprintf("daemon started (peer_id=%s)", a.PeerID))
+	go a.heartbeatLoop(ctx)
+
+	if a.Config.Global.Relay != "" {
+		for _, g := range a.groups {
+			a.startRelay(ctx, g)
+		}
+	}
+
 	go a.peerDialLoop(ctx)
 	return nil
+}
+
+func (a *App) startRelay(ctx context.Context, g *Group) {
+	relayCtx, cancel := context.WithCancel(ctx)
+	g.relayCancel = cancel
+
+	go func() {
+		addr := a.Config.Global.Relay
+		key := a.Config.Global.RelayKey
+		backoff := 5 * time.Second
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			default:
+			}
+			client := relay.NewClient(relay.ClientConfig{
+				Addr:      addr,
+				Key:       key,
+				SyncName:  g.Cfg.Name,
+				SyncKey:   g.Cfg.SyncKey,
+				PeerID:    a.PeerID,
+				Role:      string(g.Cfg.Role),
+				Direction: string(g.Cfg.Direction),
+				OnPeer: func(peerID, peerAddr string, conn net.Conn) {
+					for _, existing := range g.Engine.ListPeers() {
+						if existing.ID == peerID {
+							return
+						}
+					}
+					if err := relay.ConnectPeer(g.Engine, peerID, peerAddr, conn); err != nil {
+						log.Printf("[%s] relay peer %s: %v", g.Cfg.Name, peerID, err)
+						return
+					}
+					log.Printf("[%s] relay connected to peer %s", g.Cfg.Name, peerID)
+					_ = a.Store.AppendActivity(g.Cfg.Name, "info", fmt.Sprintf("relay peer %s", peerID))
+				},
+			})
+			log.Printf("[%s] connecting to relay %s", g.Cfg.Name, addr)
+			if err := client.Run(relayCtx); err != nil {
+				select {
+				case <-relayCtx.Done():
+					return
+				default:
+					log.Printf("[%s] relay: %v (retry in %s)", g.Cfg.Name, err, backoff)
+					_ = a.Store.AppendActivity(g.Cfg.Name, "warn", fmt.Sprintf("relay: %v", err))
+				}
+			}
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff += 5 * time.Second
+			}
+		}
+	}()
+}
+
+func (a *App) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = a.Store.TouchDaemon()
+		}
+	}
 }
 
 func (a *App) startGroup(ctx context.Context, syncCfg config.Sync, port int) (*Group, error) {
@@ -185,6 +273,7 @@ func (a *App) handleInbound(conn net.Conn) {
 	p := &syncengine.Peer{ID: peerID, Addr: addr, Conn: conn}
 	g.Engine.AddPeer(p)
 	log.Printf("[%s] inbound peer %s from %s", g.Cfg.Name, peerID, addr)
+	_ = a.Store.AppendActivity(g.Cfg.Name, "info", fmt.Sprintf("inbound peer %s from %s", peerID, addr))
 	go g.Engine.OnPeerConnected()
 	go g.Engine.HandleIncoming(p)
 }
@@ -234,13 +323,18 @@ func (a *App) tryDialGroup(g *Group, addr string) {
 		p, err := g.Engine.ConnectAndHello(addr, transport.Dial)
 		if err != nil {
 			log.Printf("[%s] dial %s: %v", g.Cfg.Name, addr, err)
+			_ = a.Store.AppendActivity(g.Cfg.Name, "warn", fmt.Sprintf("dial %s: %v", addr, err))
 			return
 		}
 		log.Printf("[%s] connected to %s (peer %s)", g.Cfg.Name, addr, p.ID)
+		_ = a.Store.AppendActivity(g.Cfg.Name, "info", fmt.Sprintf("connected to %s", addr))
 	}()
 }
 
 func (g *Group) Stop() {
+	if g.relayCancel != nil {
+		g.relayCancel()
+	}
 	if g.Watcher != nil {
 		g.Watcher.Close()
 	}
@@ -262,26 +356,16 @@ func (a *App) Approve(syncName, folder string) error {
 	return g.Engine.ApproveFolder(folder)
 }
 
-func (a *App) Status() string {
-	var lines []string
-	for _, g := range a.groups {
-		pending, _ := g.Engine.PendingFolders()
-		lines = append(lines, fmt.Sprintf("[%s] path=%s peers=%d pending=%v direction=%s role=%s approval=%s",
-			g.Cfg.Name, g.Cfg.LocalPath, g.Engine.PeerCount(), pending,
-			g.Cfg.Direction, g.Cfg.Role, g.Cfg.Approval))
-	}
-	summary, _ := a.Store.StatusSummary()
-	lines = append(lines, summary)
-	return fmt.Sprintf("%s\npeer_id=%s", joinLines(lines), a.PeerID)
+func (a *App) Status(verbose bool) string {
+	return StatusReport(a.Config, a.Store, verbose)
 }
 
-func joinLines(lines []string) string {
-	out := ""
-	for i, l := range lines {
-		if i > 0 {
-			out += "\n"
-		}
-		out += l
+// StatusFromConfig reads live daemon state from SQLite (works while service runs).
+func StatusFromConfig(cfg *config.Config, verbose bool) (string, error) {
+	store, err := state.Open(cfg.Global.DataDir)
+	if err != nil {
+		return "", err
 	}
-	return out
+	defer store.Close()
+	return StatusReport(cfg, store, verbose), nil
 }

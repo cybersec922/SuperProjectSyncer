@@ -2,6 +2,12 @@
 listen = "0.0.0.0:7741"
 data_dir = "~/.superprojectsyncer"
 discovery = true
+# log_file = ""          # default: <data_dir>/sps.log
+# log_file = "none"      # stderr only, no file
+
+# Relay hub (when both peers are behind NAT — no public IP on either side):
+# relay = "75.119.139.223:7750"
+# relay_key = "same-secret-as-relay.example.toml"
 
 [[sync]]
 name = "sync-example"

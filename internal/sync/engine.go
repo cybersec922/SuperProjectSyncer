@@ -127,6 +127,7 @@ func (e *Engine) OnPeerConnected() {
 		return
 	}
 	log.Printf("[%s] initial push to peer: %d files", e.Cfg.Name, len(manifest.Files))
+	e.logActivity("info", "initial push: %d files", len(manifest.Files))
 	e.broadcastFolder(".")
 }
 
@@ -207,6 +208,14 @@ func fileMeta(path string, info os.FileInfo) (string, int64, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), info.Size(), info.ModTime().Unix(), nil
 }
 
+func (e *Engine) logActivity(level, format string, args ...any) {
+	if e.Store == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	_ = e.Store.AppendActivity(e.Cfg.Name, level, msg)
+}
+
 func (e *Engine) sendManifest(p *Peer, manifest protocol.Manifest) {
 	if err := protocol.WriteJSON(p.Conn, protocol.TypeManifest, manifest); err != nil {
 		log.Printf("[%s] send manifest to %s: %v", e.Cfg.Name, p.Addr, err)
@@ -260,6 +269,7 @@ func (e *Engine) HandleIncoming(p *Peer) {
 
 func (e *Engine) applyManifest(p *Peer, remote protocol.Manifest) {
 	var needed []string
+	var bytesTotal int64
 	for _, f := range remote.Files {
 		if e.Ignore.Ignored(f.Path) {
 			continue
@@ -280,21 +290,54 @@ func (e *Engine) applyManifest(p *Peer, remote protocol.Manifest) {
 				}
 			}
 			needed = append(needed, f.Path)
+			bytesTotal += f.Size
 		}
 	}
 	if len(needed) == 0 {
 		return
 	}
+	e.logActivity("info", "receiving %d files (%s) from %s", len(needed), state.FormatBytes(bytesTotal), p.Addr)
+	var jobID int64
+	if e.Store != nil {
+		jobID, _ = e.Store.StartSyncJob(e.Cfg.Name, p.Addr, "receive", len(needed), bytesTotal)
+	}
 	if err := protocol.WriteJSON(p.Conn, protocol.TypeNeed, protocol.Need{Paths: needed}); err != nil {
 		log.Printf("[%s] request files: %v", e.Cfg.Name, err)
+		if jobID != 0 {
+			_ = e.Store.FinishSyncJob(jobID, "failed", err.Error())
+		}
 		return
 	}
-	for _, path := range needed {
+	var doneBytes int64
+	for i, path := range needed {
+		fileSize := int64(0)
+		for _, f := range remote.Files {
+			if f.Path == path {
+				fileSize = f.Size
+				break
+			}
+		}
+		if jobID != 0 {
+			_ = e.Store.UpdateSyncJob(jobID, i, doneBytes, path)
+		}
 		if err := e.receiveFile(p.Conn, path); err != nil {
 			log.Printf("[%s] receive %s: %v", e.Cfg.Name, path, err)
+			e.logActivity("error", "receive failed %s: %v", path, err)
+			if jobID != 0 {
+				_ = e.Store.FinishSyncJob(jobID, "failed", err.Error())
+			}
 			return
 		}
+		doneBytes += fileSize
+		if jobID != 0 {
+			_ = e.Store.UpdateSyncJob(jobID, i+1, doneBytes, "")
+		}
+		e.logActivity("info", "received %s (%s)", path, state.FormatBytes(fileSize))
 	}
+	if jobID != 0 {
+		_ = e.Store.FinishSyncJob(jobID, "completed", "")
+	}
+	e.logActivity("info", "receive complete: %d files from %s", len(needed), p.Addr)
 }
 
 func shouldSkip(localPath string, remote protocol.FileEntry, dir config.Direction) bool {
@@ -380,6 +423,30 @@ func (e *Engine) receiveFile(conn net.Conn, relPath string) error {
 }
 
 func (e *Engine) sendFiles(p *Peer, paths []string) {
+	var bytesTotal int64
+	sizes := make(map[string]int64, len(paths))
+	for _, rel := range paths {
+		if e.Ignore.Ignored(rel) {
+			continue
+		}
+		abs := filepath.Join(e.Cfg.LocalPath, filepath.FromSlash(rel))
+		fi, err := os.Stat(abs)
+		if err == nil {
+			sizes[rel] = fi.Size()
+			bytesTotal += fi.Size()
+		}
+	}
+	sendCount := len(sizes)
+	if sendCount == 0 {
+		return
+	}
+	e.logActivity("info", "sending %d files (%s) to %s", sendCount, state.FormatBytes(bytesTotal), p.Addr)
+	var jobID int64
+	if e.Store != nil {
+		jobID, _ = e.Store.StartSyncJob(e.Cfg.Name, p.Addr, "send", sendCount, bytesTotal)
+	}
+	var doneBytes int64
+	doneFiles := 0
 	for _, rel := range paths {
 		if e.Ignore.Ignored(rel) {
 			continue
@@ -390,12 +457,28 @@ func (e *Engine) sendFiles(p *Peer, paths []string) {
 			log.Printf("[%s] read %s: %v", e.Cfg.Name, rel, err)
 			continue
 		}
+		if jobID != 0 {
+			_ = e.Store.UpdateSyncJob(jobID, doneFiles, doneBytes, rel)
+		}
 		chunk := protocol.Chunk{Path: rel, Offset: 0, Data: data, Final: true}
 		if err := protocol.WriteJSON(p.Conn, protocol.TypeChunk, chunk); err != nil {
 			log.Printf("[%s] send chunk %s: %v", e.Cfg.Name, rel, err)
+			if jobID != 0 {
+				_ = e.Store.FinishSyncJob(jobID, "failed", err.Error())
+			}
 			return
 		}
+		doneFiles++
+		doneBytes += int64(len(data))
+		if jobID != 0 {
+			_ = e.Store.UpdateSyncJob(jobID, doneFiles, doneBytes, "")
+		}
+		e.logActivity("info", "sent %s (%s)", rel, state.FormatBytes(int64(len(data))))
 	}
+	if jobID != 0 {
+		_ = e.Store.FinishSyncJob(jobID, "completed", "")
+	}
+	e.logActivity("info", "send complete: %d files to %s", doneFiles, p.Addr)
 }
 
 // PullFromPeers requests full manifest from connected providers.

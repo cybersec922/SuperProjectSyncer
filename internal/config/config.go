@@ -35,6 +35,9 @@ type Global struct {
 	Listen    string `toml:"listen"`
 	DataDir   string `toml:"data_dir"`
 	Discovery bool   `toml:"discovery"`
+	LogFile   string `toml:"log_file"` // empty = data_dir/sps.log; "none" = stderr only
+	Relay     string `toml:"relay"`    // optional relay server host:port (for NAT/NAT sync)
+	RelayKey  string `toml:"relay_key"` // auth key for relay; defaults to first sync's sync_key
 }
 
 type Sync struct {
@@ -89,6 +92,9 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Syncs) == 0 {
 		return fmt.Errorf("at least one [[sync]] section is required")
+	}
+	if c.Global.Relay != "" && c.Global.RelayKey == "" {
+		return fmt.Errorf("global.relay_key is required when global.relay is set")
 	}
 	names := make(map[string]bool)
 	for i, s := range c.Syncs {

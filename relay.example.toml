@@ -1,0 +1,8 @@
+# SuperProjectSyncer relay server — run on a machine with a public IP.
+# Both sync peers connect OUT to this relay (no inbound ports needed on peers).
+
+listen = "0.0.0.0:7750"
+key = "change-me-long-random-relay-secret"
+
+# Optional log file (default: stderr only for relay unless set)
+# log_file = "/var/log/sps-relay.log"
