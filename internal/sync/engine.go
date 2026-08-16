@@ -163,22 +163,38 @@ func (e *Engine) buildManifestForFolder(folder string) (protocol.Manifest, error
 	}
 	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
-		}
-		if info.IsDir() {
+			log.Printf("[%s] walk skip %s: %v", e.Cfg.Name, path, err)
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
 		}
 		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			rel = ""
+		}
+		if info.IsDir() {
+			check := rel
+			if check != "" {
+				check += "/"
+			}
+			if e.Ignore.Ignored(rel) || e.Ignore.Ignored(check) || e.Ignore.Ignored(rel+"/**") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Skip symlinks (e.g. .venv/lib64 → lib) — reading them as files fails.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if e.Ignore.Ignored(rel) {
 			return nil
 		}
 		hash, size, mtime, err := fileMeta(path, info)
 		if err != nil {
-			return err
+			log.Printf("[%s] skip file %s: %v", e.Cfg.Name, rel, err)
+			return nil
 		}
 		files = append(files, protocol.FileEntry{Path: rel, Hash: hash, Size: size, Mtime: mtime})
 		if e.Store != nil {
@@ -240,6 +256,10 @@ func (e *Engine) HandleIncoming(p *Peer) {
 				return
 			}
 			e.AddPeer(p)
+			// Provider: push full tree when a peer says hello (covers relay joins).
+			if e.Cfg.CanSend() {
+				go e.OnPeerConnected()
+			}
 		case protocol.TypeManifest:
 			if !e.Cfg.CanReceive() {
 				continue

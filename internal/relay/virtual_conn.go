@@ -25,7 +25,7 @@ func newVirtualConn(c *Client, peerID string) *virtualConn {
 		relay:    c,
 		peerID:   peerID,
 		addr:     PeerAddr(peerID),
-		incoming: make(chan []byte, 32),
+		incoming: make(chan []byte, 256),
 		closeCh:  make(chan struct{}),
 	}
 }
@@ -72,9 +72,11 @@ func (v *virtualConn) Write(b []byte) (int, error) {
 }
 
 func (v *virtualConn) deliver(msgType byte, payload []byte) {
+	frame := PackSyncFrame(msgType, payload)
 	select {
-	case v.incoming <- PackSyncFrame(msgType, payload):
-	default:
+	case <-v.closeCh:
+		return
+	case v.incoming <- frame:
 	}
 }
 

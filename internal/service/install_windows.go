@@ -5,9 +5,11 @@ package service
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -29,11 +31,16 @@ func installWindows(exePath, configPath string) error {
 
 	_ = uninstallWindowsMgr(m)
 
+	if err := eventlog.InstallAsEventCreate(serviceName, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil {
+		return fmt.Errorf("register event log: %w", err)
+	}
+
+	args := []string{"run", "--config", quoteServiceArg(configPath)}
 	s, err := m.CreateService(serviceName, exePath, mgr.Config{
 		DisplayName:      serviceName,
 		StartType:        mgr.StartAutomatic,
 		ServiceStartName: "", // LocalSystem
-	}, "run", "--config", configPath)
+	}, args...)
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
 	}
@@ -43,6 +50,14 @@ func installWindows(exePath, configPath string) error {
 		return fmt.Errorf("start service: %w", err)
 	}
 	return nil
+}
+
+// quoteServiceArg ensures paths with spaces survive Windows service registration.
+func quoteServiceArg(s string) string {
+	if strings.ContainsAny(s, " \t") {
+		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	}
+	return s
 }
 
 func uninstallWindows() error {
@@ -77,5 +92,6 @@ func uninstallWindowsMgr(m *mgr.Mgr) error {
 	if err := s.Delete(); err != nil {
 		return fmt.Errorf("delete service: %w", err)
 	}
+	_ = eventlog.Remove(serviceName)
 	return nil
 }
