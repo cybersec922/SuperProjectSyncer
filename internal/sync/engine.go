@@ -57,7 +57,7 @@ func (e *Engine) SyncName() string   { return e.Cfg.Name }
 func (e *Engine) AddPeer(p *Peer) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if old, ok := e.peers[p.ID]; ok && old.Conn != nil {
+	if old, ok := e.peers[p.ID]; ok && old.Conn != nil && old.Conn != p.Conn {
 		old.Conn.Close()
 	}
 	e.peers[p.ID] = p
