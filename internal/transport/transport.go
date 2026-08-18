@@ -69,7 +69,12 @@ func Listen(addr string, syncKey string) (*Listener, error) {
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
-	return l.ln.Accept()
+	conn, err := l.ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+	EnableKeepAlive(conn)
+	return conn, nil
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -85,6 +90,25 @@ func Dial(addr string, syncKey string, timeout time.Duration) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	d := &net.Dialer{Timeout: timeout}
-	return tls.DialWithDialer(d, "tcp", addr, cfg)
+	d := &net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second}
+	conn, err := tls.DialWithDialer(d, "tcp", addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	EnableKeepAlive(conn)
+	return conn, nil
+}
+
+// EnableKeepAlive turns on TCP keepalives so NAT/WARP idle drops are detected.
+func EnableKeepAlive(conn net.Conn) {
+	c := conn
+	if tc, ok := conn.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(15 * time.Second)
 }

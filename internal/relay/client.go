@@ -25,6 +25,7 @@ type Client struct {
 	direction string
 
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	conn    net.Conn
 	peers   map[string]*virtualConn
 	onPeer  PeerHandler
@@ -55,6 +56,11 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 }
 
+const (
+	pingInterval = 15 * time.Second
+	readIdle     = 45 * time.Second
+)
+
 func (c *Client) Run(ctx context.Context) error {
 	conn, err := transport.Dial(c.addr, c.key, 15*time.Second)
 	if err != nil {
@@ -69,6 +75,7 @@ func (c *Client) Run(ctx context.Context) error {
 	if err := WriteJSON(conn, TypeAuth, Auth{Key: c.key}); err != nil {
 		return err
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(readIdle))
 	msgType, payload, err := ReadFrame(conn)
 	if err != nil {
 		return err
@@ -94,19 +101,24 @@ func (c *Client) Run(ctx context.Context) error {
 		return err
 	}
 
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go c.pingLoop(ctx, stopPing)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(readIdle))
 		msgType, payload, err = ReadFrame(conn)
 		if err != nil {
-			return err
+			return fmt.Errorf("relay connection lost: %w", err)
 		}
 		switch msgType {
 		case TypeRegisterOK:
-			log.Printf("[%s] relay: registered at %s", c.syncName, c.addr)
+			log.Printf("[%s] relay: registered at %s peer_id=%s", c.syncName, c.addr, c.peerID)
 		case TypePeerJoin:
 			var pj PeerJoin
 			if err := json.Unmarshal(payload, &pj); err != nil {
@@ -135,14 +147,39 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
+func (c *Client) pingLoop(ctx context.Context, stop <-chan struct{}) {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-t.C:
+			c.mu.Lock()
+			conn := c.conn
+			c.mu.Unlock()
+			if conn == nil {
+				return
+			}
+			if err := c.writeFrame(conn, TypePing, nil); err != nil {
+				log.Printf("[%s] relay: ping failed: %v", c.syncName, err)
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) handlePeerJoin(pj PeerJoin) {
 	if pj.PeerID == c.peerID {
 		return
 	}
 	c.mu.Lock()
-	if _, ok := c.peers[pj.PeerID]; ok {
-		c.mu.Unlock()
-		return
+	if old, ok := c.peers[pj.PeerID]; ok {
+		_ = old.Close()
+		delete(c.peers, pj.PeerID)
 	}
 	vc := newVirtualConn(c, pj.PeerID)
 	c.peers[pj.PeerID] = vc
@@ -174,6 +211,17 @@ func (c *Client) handleData(d Data) {
 	}
 	c.mu.Lock()
 	vc, ok := c.peers[from]
+	if !ok && from != "" && from != c.peerID {
+		vc = newVirtualConn(c, from)
+		c.peers[from] = vc
+		c.mu.Unlock()
+		log.Printf("[%s] relay: attaching unknown peer %s on first data", c.syncName, from)
+		if c.onPeer != nil {
+			c.onPeer(from, PeerAddr(from), vc)
+		}
+		vc.deliver(d.MsgType, d.Payload)
+		return
+	}
 	c.mu.Unlock()
 	if !ok {
 		return
@@ -188,11 +236,21 @@ func (c *Client) sendData(toPeerID string, msgType byte, payload []byte) error {
 	if conn == nil {
 		return fmt.Errorf("relay: not connected")
 	}
-	return WriteJSON(conn, TypeData, Data{
+	body, err := json.Marshal(Data{
 		ToPeerID: toPeerID,
 		MsgType:  msgType,
 		Payload:  payload,
 	})
+	if err != nil {
+		return err
+	}
+	return c.writeFrame(conn, TypeData, body)
+}
+
+func (c *Client) writeFrame(conn net.Conn, msgType byte, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return WriteFrame(conn, msgType, payload)
 }
 
 func (c *Client) closeAll() {

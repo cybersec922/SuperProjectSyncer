@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/superdata/superprojectsyncer/internal/transport"
 )
@@ -125,6 +126,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	var existing []PeerJoin
 	rm.mu.Lock()
 	if old, dup := rm.members[reg.PeerID]; dup {
+		// Close the stale socket only. Do not delete-by-id after this:
+		// the old handleConn would otherwise remove *this* new member.
+		log.Printf("relay: [%s] replacing session for peer %s", reg.SyncName, reg.PeerID)
 		old.conn.Close()
 		delete(rm.members, reg.PeerID)
 	}
@@ -135,12 +139,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	rm.mu.Unlock()
 
 	if err := WriteFrame(conn, TypeRegisterOK, nil); err != nil {
-		s.removeMember(rk, reg.PeerID)
+		s.removeMemberIf(rk, m)
 		return
 	}
 	for _, pj := range existing {
 		if err := writeJSONLocked(m, TypePeerJoin, pj); err != nil {
-			s.removeMember(rk, reg.PeerID)
+			s.removeMemberIf(rk, m)
 			return
 		}
 	}
@@ -157,14 +161,15 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	log.Printf("relay: [%s] peer %s joined room (%s) from %s", reg.SyncName, reg.PeerID, reg.Role, addr)
 
 	s.readLoop(ctx, rk, m)
-	s.removeMember(rk, reg.PeerID)
-	leave := PeerLeave{PeerID: reg.PeerID}
-	rm.mu.Lock()
-	for _, other := range rm.members {
-		_ = writeJSONLocked(other, TypePeerLeave, leave)
+	if s.removeMemberIf(rk, m) {
+		leave := PeerLeave{PeerID: reg.PeerID}
+		rm.mu.Lock()
+		for _, other := range rm.members {
+			_ = writeJSONLocked(other, TypePeerLeave, leave)
+		}
+		rm.mu.Unlock()
+		log.Printf("relay: [%s] peer %s left", reg.SyncName, reg.PeerID)
 	}
-	rm.mu.Unlock()
-	log.Printf("relay: [%s] peer %s left", reg.SyncName, reg.PeerID)
 }
 
 func (s *Server) readLoop(ctx context.Context, rk string, m *member) {
@@ -174,8 +179,10 @@ func (s *Server) readLoop(ctx context.Context, rk string, m *member) {
 			return
 		default:
 		}
+		_ = m.conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 		msgType, payload, err := ReadFrame(m.conn)
 		if err != nil {
+			log.Printf("relay: peer %s disconnected: %v", m.peerID, err)
 			return
 		}
 		switch msgType {
@@ -186,7 +193,7 @@ func (s *Server) readLoop(ctx context.Context, rk string, m *member) {
 			}
 			s.forward(rk, m.peerID, d)
 		case TypePing:
-			_ = WriteFrame(m.conn, TypePing, nil)
+			_ = writeFrameLocked(m, TypePing, nil)
 		default:
 			continue
 		}
@@ -206,22 +213,30 @@ func (s *Server) forward(rk, fromPeerID string, d Data) {
 	if !ok || target.peerID == fromPeerID {
 		return
 	}
-	_ = writeJSONLocked(target, TypeData, Data{
+	if err := writeJSONLocked(target, TypeData, Data{
 		FromPeerID: fromPeerID,
 		MsgType:    d.MsgType,
 		Payload:    d.Payload,
-	})
+	}); err != nil {
+		log.Printf("relay: forward to %s failed: %v", target.peerID, err)
+		_ = target.conn.Close()
+	}
 }
 
-func (s *Server) removeMember(rk, peerID string) {
+// removeMemberIf drops m only if it is still the mapped session for that peer ID.
+func (s *Server) removeMemberIf(rk string, m *member) bool {
 	s.mu.Lock()
 	rm := s.rooms[rk]
 	s.mu.Unlock()
 	if rm == nil {
-		return
+		return false
 	}
 	rm.mu.Lock()
-	delete(rm.members, peerID)
+	cur, ok := rm.members[m.peerID]
+	removed := ok && cur == m
+	if removed {
+		delete(rm.members, m.peerID)
+	}
 	empty := len(rm.members) == 0
 	rm.mu.Unlock()
 	if empty {
@@ -229,6 +244,7 @@ func (s *Server) removeMember(rk, peerID string) {
 		delete(s.rooms, rk)
 		s.mu.Unlock()
 	}
+	return removed
 }
 
 func writeJSONLocked(m *member, msgType byte, v any) error {
@@ -236,6 +252,10 @@ func writeJSONLocked(m *member, msgType byte, v any) error {
 	if err != nil {
 		return err
 	}
+	return writeFrameLocked(m, msgType, payload)
+}
+
+func writeFrameLocked(m *member, msgType byte, payload []byte) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 	return WriteFrame(m.conn, msgType, payload)

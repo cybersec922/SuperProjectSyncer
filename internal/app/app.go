@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/superdata/superprojectsyncer/internal/approval"
 	"github.com/superdata/superprojectsyncer/internal/config"
 	"github.com/superdata/superprojectsyncer/internal/discovery"
@@ -47,10 +46,15 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state: %w", err)
 	}
+	peerID, err := store.GetOrCreatePeerID()
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("peer id: %w", err)
+	}
 	return &App{
 		Config:  cfg,
 		Store:   store,
-		PeerID:  uuid.NewString(),
+		PeerID:  peerID,
 		dialing: make(map[string]bool),
 		groupBy: make(map[string]*Group),
 	}, nil
@@ -138,11 +142,6 @@ func (a *App) startRelay(ctx context.Context, g *Group) {
 				Role:      string(g.Cfg.Role),
 				Direction: string(g.Cfg.Direction),
 				OnPeer: func(peerID, peerAddr string, conn net.Conn) {
-					for _, existing := range g.Engine.ListPeers() {
-						if existing.ID == peerID {
-							return
-						}
-					}
 					if err := relay.ConnectPeer(g.Engine, peerID, peerAddr, conn); err != nil {
 						log.Printf("[%s] relay peer %s: %v", g.Cfg.Name, peerID, err)
 						return
@@ -152,12 +151,17 @@ func (a *App) startRelay(ctx context.Context, g *Group) {
 				},
 			})
 			log.Printf("[%s] connecting to relay %s", g.Cfg.Name, addr)
-			if err := client.Run(relayCtx); err != nil {
+			started := time.Now()
+			err := client.Run(relayCtx)
+			if time.Since(started) > 20*time.Second {
+				backoff = 5 * time.Second
+			}
+			if err != nil {
 				select {
 				case <-relayCtx.Done():
 					return
 				default:
-					log.Printf("[%s] relay: %v (retry in %s)", g.Cfg.Name, err, backoff)
+					log.Printf("[%s] relay: %v (reconnect in %s)", g.Cfg.Name, err, backoff)
 					_ = a.Store.AppendActivity(g.Cfg.Name, "warn", fmt.Sprintf("relay: %v", err))
 				}
 			}
@@ -279,7 +283,7 @@ func (a *App) handleInbound(conn net.Conn) {
 }
 
 func (a *App) peerDialLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -292,6 +296,9 @@ func (a *App) peerDialLoop(ctx context.Context) {
 				}
 				if g.Cfg.CanInitiatePull() {
 					g.Engine.PullFromPeers()
+				}
+				if g.Cfg.CanSend() {
+					g.Engine.CatchUp()
 				}
 			}
 		}

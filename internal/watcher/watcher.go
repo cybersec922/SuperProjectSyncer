@@ -11,7 +11,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const debounceInterval = 500 * time.Millisecond
+const debounceInterval = 800 * time.Millisecond
 
 // OnFolderChange is called with top-level folder relative to root when changes settle.
 type OnFolderChange func(folder string)
@@ -80,7 +80,7 @@ func (w *Watcher) Run() {
 }
 
 func (w *Watcher) handleEvent(ev fsnotify.Event) {
-	if ev.Op&fsnotify.Chmod == fsnotify.Chmod {
+	if ev.Op&fsnotify.Chmod == fsnotify.Chmod && ev.Op&^fsnotify.Chmod == 0 {
 		return
 	}
 	path := filepath.Clean(ev.Name)
@@ -93,11 +93,12 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		return
 	}
 	folder := topLevelFolder(rel)
-	if ev.Op&fsnotify.Create == fsnotify.Create {
+	if ev.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 		if statIsDir(path) {
 			_ = w.addRecursive(path)
 		}
 	}
+	log.Printf("watcher: %s %s (folder %s)", ev.Op, rel, folder)
 	w.schedule(folder)
 }
 

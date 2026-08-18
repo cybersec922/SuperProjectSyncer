@@ -107,6 +107,7 @@ func (e *Engine) OnFolderChanged(folder string) {
 	if !e.Cfg.CanSend() {
 		return
 	}
+	log.Printf("[%s] local change in folder %q — building push", e.Cfg.Name, folder)
 	if e.Approval != nil {
 		e.Approval.Wait(folder)
 	}
@@ -138,6 +139,7 @@ func (e *Engine) broadcastFolder(folder string) {
 		return
 	}
 	if len(manifest.Files) == 0 {
+		log.Printf("[%s] push folder %q: 0 files (nothing to send)", e.Cfg.Name, folder)
 		return
 	}
 	e.mu.Lock()
@@ -146,6 +148,10 @@ func (e *Engine) broadcastFolder(folder string) {
 		peers = append(peers, p)
 	}
 	e.mu.Unlock()
+	log.Printf("[%s] push folder %q: %d files to %d peer(s)", e.Cfg.Name, folder, len(manifest.Files), len(peers))
+	if len(peers) == 0 {
+		return
+	}
 	for _, p := range peers {
 		go e.sendManifest(p, manifest)
 	}
@@ -188,7 +194,7 @@ func (e *Engine) buildManifestForFolder(folder string) (protocol.Manifest, error
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
-		if e.Ignore.Ignored(rel) {
+		if isTempRel(rel) || e.Ignore.Ignored(rel) {
 			return nil
 		}
 		hash, size, mtime, err := fileMeta(path, info)
@@ -291,7 +297,7 @@ func (e *Engine) applyManifest(p *Peer, remote protocol.Manifest) {
 	var needed []string
 	var bytesTotal int64
 	for _, f := range remote.Files {
-		if e.Ignore.Ignored(f.Path) {
+		if e.Ignore.Ignored(f.Path) || isTempRel(f.Path) {
 			continue
 		}
 		localPath := filepath.Join(e.Cfg.LocalPath, filepath.FromSlash(f.Path))
@@ -314,9 +320,10 @@ func (e *Engine) applyManifest(p *Peer, remote protocol.Manifest) {
 		}
 	}
 	if len(needed) == 0 {
+		log.Printf("[%s] manifest from %s: %d files, 0 needed (already in sync)", e.Cfg.Name, p.Addr, len(remote.Files))
 		return
 	}
-	e.logActivity("info", "receiving %d files (%s) from %s", len(needed), state.FormatBytes(bytesTotal), p.Addr)
+	log.Printf("[%s] receiving %d/%d files (%s) from %s", e.Cfg.Name, len(needed), len(remote.Files), state.FormatBytes(bytesTotal), p.Addr)
 	var jobID int64
 	if e.Store != nil {
 		jobID, _ = e.Store.StartSyncJob(e.Cfg.Name, p.Addr, "receive", len(needed), bytesTotal)
@@ -353,6 +360,7 @@ func (e *Engine) applyManifest(p *Peer, remote protocol.Manifest) {
 			_ = e.Store.UpdateSyncJob(jobID, i+1, doneBytes, "")
 		}
 		e.logActivity("info", "received %s (%s)", path, state.FormatBytes(fileSize))
+		log.Printf("[%s] received %s (%s)", e.Cfg.Name, path, state.FormatBytes(fileSize))
 	}
 	if jobID != 0 {
 		_ = e.Store.FinishSyncJob(jobID, "completed", "")
@@ -461,6 +469,7 @@ func (e *Engine) sendFiles(p *Peer, paths []string) {
 		return
 	}
 	e.logActivity("info", "sending %d files (%s) to %s", sendCount, state.FormatBytes(bytesTotal), p.Addr)
+	log.Printf("[%s] sending %d files (%s) to %s", e.Cfg.Name, sendCount, state.FormatBytes(bytesTotal), p.Addr)
 	var jobID int64
 	if e.Store != nil {
 		jobID, _ = e.Store.StartSyncJob(e.Cfg.Name, p.Addr, "send", sendCount, bytesTotal)
@@ -494,6 +503,7 @@ func (e *Engine) sendFiles(p *Peer, paths []string) {
 			_ = e.Store.UpdateSyncJob(jobID, doneFiles, doneBytes, "")
 		}
 		e.logActivity("info", "sent %s (%s)", rel, state.FormatBytes(int64(len(data))))
+		log.Printf("[%s] sent %s (%s)", e.Cfg.Name, rel, state.FormatBytes(int64(len(data))))
 	}
 	if jobID != 0 {
 		_ = e.Store.FinishSyncJob(jobID, "completed", "")
@@ -582,4 +592,92 @@ func (e *Engine) CanReceive() bool { return e.Cfg.CanReceive() }
 
 func RelPathClean(p string) string {
 	return filepath.ToSlash(strings.TrimPrefix(p, "./"))
+}
+
+func isTempRel(rel string) bool {
+	base := strings.ToLower(filepath.Base(rel))
+	if strings.HasPrefix(base, ".~") || strings.HasPrefix(base, "~$") {
+		return true
+	}
+	for _, suf := range []string{".tmp", ".sps.tmp", ".swp", ".swo", ".partial"} {
+		if strings.HasSuffix(base, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+// CatchUp sends only files whose size/mtime changed since last scan (provider fallback
+// when fsnotify misses Cursor atomic saves or the relay was briefly dead).
+func (e *Engine) CatchUp() {
+	if !e.Cfg.CanSend() {
+		return
+	}
+	if e.PeerCount() == 0 {
+		return
+	}
+	var changed []protocol.FileEntry
+	root := e.Cfg.LocalPath
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			rel = ""
+		}
+		if info.IsDir() {
+			check := rel
+			if check != "" {
+				check += "/"
+			}
+			if e.Ignore.Ignored(rel) || e.Ignore.Ignored(check) || e.Ignore.Ignored(rel+"/**") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if isTempRel(rel) || e.Ignore.Ignored(rel) {
+			return nil
+		}
+		mtime := info.ModTime().Unix()
+		size := info.Size()
+		if e.Store != nil {
+			rec, exists, _ := e.Store.GetFile(e.Cfg.Name, rel)
+			if exists && rec.Size == size && rec.Mtime == mtime {
+				return nil
+			}
+		}
+		hash, _, _, herr := fileMeta(path, info)
+		if herr != nil {
+			return nil
+		}
+		changed = append(changed, protocol.FileEntry{Path: rel, Hash: hash, Size: size, Mtime: mtime})
+		if e.Store != nil {
+			_ = e.Store.UpsertFile(e.Cfg.Name, state.FileRecord{
+				RelPath: rel, Hash: hash, Size: size, Mtime: mtime,
+			})
+		}
+		return nil
+	})
+	if len(changed) == 0 {
+		return
+	}
+	log.Printf("[%s] catch-up: %d changed file(s)", e.Cfg.Name, len(changed))
+	manifest := protocol.Manifest{SyncName: e.Cfg.Name, Files: changed}
+	e.mu.Lock()
+	peers := make([]*Peer, 0, len(e.peers))
+	for _, p := range e.peers {
+		peers = append(peers, p)
+	}
+	e.mu.Unlock()
+	for _, p := range peers {
+		go e.sendManifest(p, manifest)
+	}
 }

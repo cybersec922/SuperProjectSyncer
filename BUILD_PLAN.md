@@ -153,12 +153,13 @@ Separate message types on the relay TCP connection (`internal/relay/protocol.go`
 | PEER_JOIN | 24 | notify client of peer in same room |
 | PEER_LEAVE | 25 | peer disconnected |
 | DATA | 26 | forward sync frame to target peer |
+| PING | 28 | heartbeat every 15s; 45s idle read deadline (reconnect) |
 
-Room key: `sync_name` + `sync_key`. Relay bridges sync traffic via virtual `net.Conn` per remote peer on the client.
+Room key: `sync_name` + `sync_key`. Relay bridges sync traffic via virtual `net.Conn` per remote peer on the client. Peer IDs are persisted in SQLite (`local_identity`) so a restart is the same device. Re-registering the same ID replaces the old session without kicking the new one.
 
 ### Sync behavior
 
-1. Watch `local_path`, debounce per top-level folder (500ms)
+1. Watch `local_path`, debounce per top-level folder (800ms; covers Cursor atomic `.tmp` + rename)
 2. Build folder batch; if `approval = ask_folder`, queue until approved
 3. On **provider** peer connect: push full tree (initial sync)
 4. Exchange manifests; transfer only changed files (BLAKE3 hash)
@@ -220,3 +221,4 @@ Rewrite:
 | 2026-06-21 | GitHub Releases workflow (Windows + Linux binaries) |
 | 2026-06-24 | Monitoring: `status -v`, `watch`, `logs`, SQLite activity + transfer jobs |
 | 2026-06-24 | Relay server (`sps relay run`) for sync when both peers are behind NAT |
+| 2026-08-18 | v0.2.3 live-sync: relay ping/reconnect, stable peer_id, Cursor tmp+rename watcher, send/receive logs |

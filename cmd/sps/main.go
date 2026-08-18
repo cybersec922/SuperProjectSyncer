@@ -125,7 +125,7 @@ func runCmd(args []string) {
 		if err := application.Start(ctx); err != nil {
 			return err
 		}
-		log.Printf("running with %d sync group(s); peer_id=%s", len(cfg.Syncs), application.PeerID)
+		log.Printf("running with %d sync group(s); peer_id=%s (stable)", len(cfg.Syncs), application.PeerID)
 		<-ctx.Done()
 		log.Println("shutting down...")
 		return nil

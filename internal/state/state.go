@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
@@ -35,6 +36,26 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// GetOrCreatePeerID returns a stable device id that survives restarts.
+func (s *Store) GetOrCreatePeerID() (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT peer_id FROM local_identity WHERE id=1`).Scan(&id)
+	if err == nil && id != "" {
+		return id, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	id = uuid.NewString()
+	_, err = s.db.Exec(`INSERT INTO local_identity (id, peer_id) VALUES (1, ?)
+		ON CONFLICT(id) DO NOTHING`, id)
+	if err != nil {
+		return "", err
+	}
+	_ = s.db.QueryRow(`SELECT peer_id FROM local_identity WHERE id=1`).Scan(&id)
+	return id, nil
+}
+
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS file_state (
@@ -58,6 +79,10 @@ func (s *Store) migrate() error {
 			addr TEXT NOT NULL,
 			last_seen INTEGER NOT NULL,
 			PRIMARY KEY (sync_name, peer_id)
+		);
+		CREATE TABLE IF NOT EXISTS local_identity (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			peer_id TEXT NOT NULL
 		);
 	`)
 	if err != nil {
